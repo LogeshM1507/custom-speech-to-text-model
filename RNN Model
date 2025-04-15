@@ -1,0 +1,164 @@
+import numpy as np
+import pandas as pd
+import librosa
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, Dense, TimeDistributed, Masking
+import tensorflow as tf
+import pickle
+from tensorflow.keras.backend import ctc_batch_cost
+import re
+
+
+def clean_text(text):
+    text = str(text).lower()                                        # Lowercase
+    text = re.sub(r'[^a-z0-9\s]', '', text)            # Remove non-alphabet and keep space
+    text = re.sub(r'\s+', ' ', text).strip()           # Remove extra spaces
+    return text
+
+
+# Load metadata
+metadata_path = "F:\\Audio\\metadata.csv"
+df = pd.read_csv(metadata_path, on_bad_lines="skip")
+df['sentence'] = df['sentence'].apply(clean_text)
+print(df.isna().any())
+empty_labels = df[df['sentence'].str.strip().apply(lambda x: len(x) == 0)]
+print(empty_labels)
+print(df.head())
+
+# Calculate MFCC lengths to decide padding size
+lengths = []
+for idx, row in df.iterrows():
+    signal, sr = librosa.load(row['audio_path'], sr=22050)
+    mfcc = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13)
+    lengths.append(mfcc.shape[1])
+
+max_len = int(np.percentile(lengths, 95))
+print(f"Suggested max_len: {max_len}")
+
+# Feature extraction and preprocessing
+n_mfcc = 13
+X = []
+y_texts = []
+
+for idx, row in df.iterrows():
+    audio_path = row['audio_path']
+    sentence = row['sentence']
+
+    signal, sr = librosa.load(audio_path, sr=22050)
+    mfcc = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=n_mfcc).T
+
+    # Standard Normalize per sample
+    mfcc = (mfcc - np.mean(mfcc)) / (np.std(mfcc) + 1e-9)
+
+    # Pad or trim
+    if mfcc.shape[0] < max_len:
+        mfcc = np.pad(mfcc, ((0, max_len - mfcc.shape[0]), (0, 0)), mode='constant')
+    else:
+        mfcc = mfcc[:max_len, :]
+
+    X.append(mfcc)
+    y_texts.append(sentence)
+
+X = np.array(X)
+
+# Tokenize sentences character-wise
+
+tokenizer = Tokenizer(char_level=True, lower=True, filters='')  # no filtering
+tokenizer.fit_on_texts(y_texts)
+
+y_seq = tokenizer.texts_to_sequences(y_texts)
+max_label_len = max(len(seq) for seq in y_seq)
+y_pad = pad_sequences(y_seq, maxlen=max_label_len, padding='post')
+input_lengths = np.ones((len(X), 1)) * X.shape[1]
+label_lengths = np.array([[len(seq)] for seq in y_seq])
+
+print("X shape:", X.shape)
+print("y shape:", y_pad.shape)
+print("Tokenizer vocab size:", len(tokenizer.word_index))
+
+# Save tokenizer
+with open("tokenizer.pkl", "wb") as f:
+    pickle.dump(tokenizer, f)
+
+# Model architecture
+
+# Input shape: (batch, time_steps, n_mfcc)
+input_dim = X.shape[2]
+timesteps = X.shape[1]
+output_dim = len(tokenizer.word_index) + 2  # +1 for padding, +1 for CTC 'blank'
+
+audio_input = Input(shape=(timesteps, input_dim), name='audio_input')
+x = Masking(mask_value=0.0)(audio_input)
+x = LSTM(128, return_sequences=True, dropout=0.2)(x)
+x = LSTM(128, return_sequences=True, dropout=0.2)(x)
+y_pred = TimeDistributed(Dense(output_dim, activation='softmax'), name='y_pred')(x)
+
+labels = Input(name='labels', shape=(None,), dtype='int32')  # shape: (batch, label_len)
+input_len = Input(shape=(1,), dtype='int32', name='input_length')
+label_len = Input(shape=(1,), dtype='int32', name='label_length')
+
+ctc_loss = tf.keras.layers.Lambda(
+    lambda args: ctc_batch_cost(*args),
+    name='ctc_loss')([labels, y_pred, input_len, label_len])
+
+model = Model(inputs=[audio_input, labels, input_len, label_len], outputs=ctc_loss)
+model.compile(optimizer='adam',loss=lambda y_true, y_pred: y_pred)  # loss is part of model now
+model.summary()
+from sklearn.model_selection import train_test_split
+
+# Split indices
+train_idx, val_idx = train_test_split(np.arange(len(X)), test_size=0.1, random_state=42)
+
+# Training inputs
+train_inputs = {
+    'audio_input': X[train_idx],
+    'labels': y_pad[train_idx],
+    'input_length': input_lengths[train_idx],
+    'label_length': label_lengths[train_idx]
+}
+train_outputs = np.zeros(len(train_idx))  # dummy
+
+# Validation inputs
+val_inputs = {
+    'audio_input': X[val_idx],
+    'labels': y_pad[val_idx],
+    'input_length': input_lengths[val_idx],
+    'label_length': label_lengths[val_idx]
+}
+val_outputs = np.zeros(len(val_idx))  # dummy
+
+
+outputs = np.zeros(len(X))  # dummy output (loss only)
+model.fit(train_inputs, train_outputs, validation_data=(val_inputs, val_outputs), batch_size=32, epochs=40)
+
+
+# Inverse tokenizer for decoding
+def ctc_decode_to_text(preds, tokenizer):
+    input_lengths = [preds.shape[1]] * preds.shape[0]  # for batch
+    decoded, log_prob = tf.keras.backend.ctc_decode(preds, input_length=input_lengths, greedy=False, beam_width=10,top_paths=1)
+
+    decoded_sequences = decoded[0].numpy()
+    inv_vocab = {v: k for k, v in tokenizer.word_index.items()}
+    inv_vocab[0] = ''  # blank/pad token
+    blank_token_index = tokenizer.word_index.get('', 0)
+    inv_vocab[blank_token_index] = ''
+
+    results = []
+    for seq in decoded_sequences:
+        result = ''
+        prev_char = ''
+        for idx in seq:
+            char = inv_vocab.get(idx, '')
+            if char != prev_char:
+                result += char
+            prev_char = char
+        results.append(result)
+    return results
+
+
+prediction_model = Model(inputs=audio_input, outputs=y_pred)
+# Predict
+pred = prediction_model.predict(X[:1])
+print(ctc_decode_to_text(pred, tokenizer))
