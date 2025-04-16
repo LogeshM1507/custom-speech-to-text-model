@@ -1,3 +1,6 @@
+Purpose
+This project is focused on understanding and implementing the core pipeline of an ASR system. It’s an educational, research-oriented implementation that demonstrates how real-world ASR systems function under the hood.
+
 a. Custom Speech-to-Text Model :
 
 This project implements a speech-to-text (automatic speech recognition, ASR) system built from scratch using MFCC audio features, LSTM networks, and CTC loss without any pre-trained models or external APIs.
@@ -6,7 +9,7 @@ This project implements a speech-to-text (automatic speech recognition, ASR) sys
 
 b. Features:
 
-- Preprocessing pipeline with MFCC extraction using `librosa`
+- Preprocessing pipeline with MFCC extraction using librosa
 - Calculate MFCC lengths to decide padding size
 - Character-level tokenizer for transcription
 - Deep learning model using LSTM + CTC loss
